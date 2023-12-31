@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,10 +8,12 @@ import 'package:flutter/services.dart';
 import '../../dropdown_search.dart';
 import 'checkbox_widget.dart';
 
+part 'selection_widget_scroll_pagination_listener.dart';
+
 class SelectionWidget<T> extends StatefulWidget {
   final List<T> items;
   final ValueChanged<List<T>>? onChanged;
-  final DropdownSearchOnFind<T>? asyncItems;
+  final AsyncItemsProps<T, Object>? asyncItems;
   final DropdownSearchItemAsString<T>? itemAsString;
   final DropdownSearchFilterFn<T>? filterFn;
   final DropdownSearchCompareFn<T>? compareFn;
@@ -40,9 +43,10 @@ class SelectionWidgetState<T> extends State<SelectionWidget<T>> {
   final ValueNotifier<bool> _loadingNotifier = ValueNotifier(false);
   final List<T> _cachedItems = [];
   final ValueNotifier<List<T>> _selectedItemsNotifier = ValueNotifier([]);
-  final ScrollController scrollController = ScrollController();
+  late final ScrollController scrollController;
   final List<T> _currentShowedItems = [];
-  late TextEditingController searchBoxController;
+  late final TextEditingController searchBoxController;
+  late final _ScrollPaginationListener? _scrollPaginationListener;
 
   List<T> get _selectedItems => _selectedItemsNotifier.value;
   Timer? _debounce;
@@ -51,6 +55,7 @@ class SelectionWidgetState<T> extends State<SelectionWidget<T>> {
       if (_debounce?.isActive ?? false) _debounce?.cancel();
       _debounce = Timer(widget.popupProps.searchDelay, () {
         _manageItemsByFilter(searchBoxController.text);
+        _scrollPaginationListener?.resetPage();
       });
   }
 
@@ -59,7 +64,39 @@ class SelectionWidgetState<T> extends State<SelectionWidget<T>> {
     super.initState();
     _selectedItemsNotifier.value = widget.defaultSelectedItems;
 
-    searchBoxController = widget.popupProps.searchFieldProps.controller ?? TextEditingController();
+    scrollController = widget.popupProps.listViewProps.controller ??
+      ScrollController(
+        onAttach: (scrollPosition) {
+          Future.delayed(Duration.zero, () {
+            if(_scrollPaginationListener?.props.isAutoPaginatingSmallPerPage==true) {
+              _scrollPaginationListener!.autoPaginatingSmallPerPage();
+            }
+          });
+        }
+      );
+
+    searchBoxController = widget.popupProps.searchFieldProps.controller ??
+        TextEditingController();
+
+    final asyncItems = widget.asyncItems;
+
+    if(asyncItems is AsyncItemsPaginatedProps<T>) {
+      _scrollPaginationListener = _ScrollPaginationListener<T>(
+        scrollController: scrollController,
+        searchBoxController: searchBoxController,
+        loadingNotifier: _loadingNotifier,
+        props: asyncItems,
+        onNewItemsFetched: (items) {
+          _addDataToStream(items, appendShowedItems: true);
+        },
+        onError: (e, trace) {
+          _addErrorToStream(e);
+        },
+      );
+    } else {
+      _scrollPaginationListener = null;
+    }
+
     searchBoxController.addListener(searchBoxControllerListener);
 
     Future.delayed(
@@ -84,15 +121,21 @@ class SelectionWidgetState<T> extends State<SelectionWidget<T>> {
     _itemsStream.close();
     _debounce?.cancel();
 
+    searchBoxController.removeListener(searchBoxControllerListener);
+
+    _loadingNotifier.dispose();
+    _selectedItemsNotifier.dispose();
+
     if (widget.popupProps.searchFieldProps.controller == null) {
       searchBoxController.dispose();
-    } else {
-      searchBoxController.removeListener(searchBoxControllerListener);
     }
 
     if (widget.popupProps.listViewProps.controller == null) {
       scrollController.dispose();
     }
+
+    _scrollPaginationListener?.dispose();
+
     super.dispose();
   }
 
@@ -316,10 +359,20 @@ class SelectionWidgetState<T> extends State<SelectionWidget<T>> {
     if (isFirstLoad) _cachedItems.addAll(widget.items);
 
     //manage offline items
-    if (widget.asyncItems != null && (widget.popupProps.isFilterOnline || isFirstLoad)) {
+    final asyncItems = widget.asyncItems;
+    if (asyncItems != null && (widget.popupProps.isFilterOnline || isFirstLoad)) {
       try {
         final List<T> onlineItems = [];
-        onlineItems.addAll(await widget.asyncItems!(filter));
+
+        if(asyncItems is AsyncItemsBasicProps<T>) {
+          onlineItems.addAll(await asyncItems.getter(filter));
+        } else if (asyncItems is AsyncItemsPaginatedProps<T>) {
+          onlineItems.addAll(await asyncItems.getter(AsyncItemsPaginatedParam(
+            filter: filter,
+            page: 1,
+            perPage: asyncItems.perPage
+          )));
+        }
 
         //Remove all old data
         _cachedItems.clear();
@@ -356,13 +409,18 @@ class SelectionWidgetState<T> extends State<SelectionWidget<T>> {
     _loadingNotifier.value = false;
   }
 
-  void _addDataToStream(List<T> data) {
+  void _addDataToStream(List<T> data, {
+    bool appendShowedItems = false
+  }) {
     if (_itemsStream.isClosed) return;
-    _itemsStream.add(data);
 
     //update showed data list
-    _currentShowedItems.clear();
+    if(!appendShowedItems) {
+      _currentShowedItems.clear();
+    }
     _currentShowedItems.addAll(data);
+
+    _itemsStream.add(_currentShowedItems);
   }
 
   void _addErrorToStream(Object error, [StackTrace? stackTrace]) {
